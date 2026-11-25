@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speech to Text – Hindi + English</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --muted:#94a3b8; --acc:#6366f1; --red:#ef4444; --txt:#e2e8f0; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--txt); }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; } .sub { color: var(--muted); margin-bottom: 20px; }
+  .card { background: var(--card); border-radius: 12px; padding: 16px; margin-bottom: 20px; }
+  button { background: var(--acc); color:#fff; border:0; border-radius:8px; padding:9px 16px; font-size:.95rem; cursor:pointer; }
+  button.rec { background: var(--red); } button.ghost { background:#334155; } button.sm { padding:5px 10px; font-size:.8rem; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #live { min-height: 90px; margin-top: 12px; padding: 12px; background:#0f172a; border-radius:8px; white-space:pre-wrap; line-height:1.6; }
+  #status { color: var(--muted); margin-left: 10px; font-size:.9rem; }
+  .item { border-top: 1px solid #334155; padding: 12px 0; }
+  .item:first-child { border-top: 0; }
+  .meta { color: var(--muted); font-size: .8rem; margin-bottom: 6px; }
+  .text { white-space: pre-wrap; line-height: 1.5; }
+  input, textarea { width:100%; background:#0f172a; color:var(--txt); border:1px solid #334155; border-radius:8px; padding:8px; font:inherit; margin-bottom:6px; }
+  .actions { margin-top: 8px; display:flex; gap:8px; }
+  .err { color: #fca5a5; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎙️ Real-time Speech to Text</h1>
+  <div class="sub">Speak in Hindi, English, or a mix. Transcription appears live and is saved to history.</div>
+
+  <div class="card">
+    <button id="recBtn">Start recording</button><span id="status">Idle</span>
+    <div id="live">Your transcription will appear here…</div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <strong>History</strong>
+      <button class="sm ghost" id="addBtn">+ Add manually</button>
+    </div>
+    <div id="list"></div>
+  </div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = '/api/transcriptions';
+let ws, ctx, stream, node, recording = false;
+
+// ---------- CRUD / dashboard ----------
+async function load() {
+  const items = await (await fetch(api)).json();
+  $('#list').innerHTML = items.length ? '' : '<div class="meta">No transcriptions yet.</div>';
+  items.forEach(it => $('#list').appendChild(renderItem(it)));
+}
+function renderItem(it) {
+  const d = document.createElement('div'); d.className = 'item';
+  const when = new Date(it.created_at).toLocaleString();
+  d.innerHTML = `<div class="meta">#${it.id} · ${when} · ${it.duration_sec}s</div>
+    <strong></strong><div class="text"></div>
+    <div class="actions"><button class="sm ghost" data-a="edit">Edit</button>
+    <button class="sm ghost" data-a="del">Delete</button></div>`;
+  d.querySelector('strong').textContent = it.title;
+  d.querySelector('.text').textContent = it.text;
+  d.querySelector('[data-a=del]').onclick = async () => {
+    if (confirm('Delete this transcription?')) { await fetch(`${api}/${it.id}`, {method:'DELETE'}); load(); }
+  };
+  d.querySelector('[data-a=edit]').onclick = () => editForm(d, it);
+  return d;
+}
+function editForm(d, it) {
+  d.innerHTML = `<input id="t" placeholder="Title"><textarea id="x" rows="4"></textarea>
+    <div class="actions"><button class="sm" data-a="save">Save</button><button class="sm ghost" data-a="cancel">Cancel</button></div>`;
+  d.querySelector('#t').value = it.title; d.querySelector('#x').value = it.text;
+  d.querySelector('[data-a=cancel]').onclick = load;
+  d.querySelector('[data-a=save]').onclick = async () => {
+    await fetch(`${api}/${it.id}`, {method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({title: d.querySelector('#t').value, text: d.querySelector('#x').value})});
+    load();
+  };
+}
+$('#addBtn').onclick = () => {
+  const d = document.createElement('div'); d.className = 'item';
+  $('#list').prepend(d);
+  editForm(d, {id:0, title:'', text:''});
+  d.querySelector('[data-a=cancel]').onclick = load;
+  d.querySelector('[data-a=save]').onclick = async () => {
+    await fetch(api, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({title: d.querySelector('#t').value, text: d.querySelector('#x').value})});
+    load();
+  };
+};
+
+// ---------- Real-time recording ----------
+const workletSrc = `
+class P extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0][0]; if (!ch) return true;
+    // downsample to 16 kHz (nearest-sample) and convert to int16
+    const ratio = sampleRate / 16000, n = Math.floor(ch.length / ratio), out = new Int16Array(n);
+    for (let i = 0; i < n; i++) { const s = Math.max(-1, Math.min(1, ch[Math.floor(i * ratio)])); out[i] = s < 0 ? s * 0x8000 : s * 0x7fff; }
+    this.port.postMessage(out.buffer, [out.buffer]); return true;
+  }
+}
+registerProcessor('p', P);`;
+
+async function start() {
+  stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true}});
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/transcribe`);
+  $('#live').textContent = '';
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'partial') $('#live').textContent += (($('#live').textContent ? ' ' : '') + m.text);
+    if (m.type === 'error') $('#live').innerHTML += `<div class="err">${m.message}</div>`;
+    if (m.type === 'final') { $('#status').textContent = m.id ? 'Saved ✔' : 'No speech detected'; load(); }
+  };
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+  ctx = new AudioContext();
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([workletSrc], {type:'application/javascript'})));
+  node = new AudioWorkletNode(ctx, 'p');
+  node.port.onmessage = e => ws.readyState === 1 && ws.send(e.data);
+  ctx.createMediaStreamSource(stream).connect(node);
+  recording = true; $('#recBtn').textContent = 'Stop'; $('#recBtn').className = 'rec'; $('#status').textContent = 'Listening…';
+}
+function stop() {
+  recording = false;
+  stream.getTracks().forEach(t => t.stop()); node.disconnect(); ctx.close();
+  ws.send(JSON.stringify({action: 'stop'}));
+  $('#recBtn').textContent = 'Start recording'; $('#recBtn').className = ''; $('#status').textContent = 'Finalizing…';
+}
+$('#recBtn').onclick = () => recording ? stop() : start().catch(e => { $('#status').textContent = 'Error: ' + e.message; });
+
+load();
+</script>
+</body>
+</html>
