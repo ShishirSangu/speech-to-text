@@ -1,4 +1,5 @@
 """Speech-to-text via Gemini (handles mixed Hindi + English)."""
+import asyncio
 import base64
 import io
 import os
@@ -35,14 +36,22 @@ def is_silent(pcm: bytes, threshold: int = 300) -> bool:
     return rms < threshold
 
 
+# Tried in order; if one is overloaded (503), over quota (429) or unavailable (404) we move on.
+FALLBACK_MODELS = ["gemini-3.5-transcribe", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest"]
+RETRY_STATUS = {429, 500, 503, 404}
+
+
+def _model_order() -> list[str]:
+    first = os.getenv("GEMINI_MODEL", FALLBACK_MODELS[0])
+    return [first] + [m for m in FALLBACK_MODELS if m != first]
+
+
 async def transcribe(pcm: bytes) -> str:
     if not pcm or is_silent(pcm):
         return ""
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not set")
-    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body = {
         "contents": [
             {
@@ -58,12 +67,20 @@ async def transcribe(pcm: bytes) -> str:
             }
         ]
     }
+    last = ""
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, json=body, headers={"x-goog-api-key": key})
-    if r.status_code != 200:
-        raise RuntimeError(f"Gemini error {r.status_code}: {r.text[:200]}")
-    try:
-        parts = r.json()["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts).strip()
-    except (KeyError, IndexError):
-        return ""
+        for attempt in range(2):  # two passes over the model list
+            for model in _model_order():
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                r = await client.post(url, json=body, headers={"x-goog-api-key": key})
+                if r.status_code == 200:
+                    try:
+                        parts = r.json()["candidates"][0]["content"]["parts"]
+                        return "".join(p.get("text", "") for p in parts).strip()
+                    except (KeyError, IndexError):
+                        return ""
+                last = f"{model}: {r.status_code} {r.text[:120]}"
+                if r.status_code not in RETRY_STATUS:
+                    raise RuntimeError(f"Gemini error {last}")
+            await asyncio.sleep(1.5)
+    raise RuntimeError(f"All Gemini models busy or over quota. Last: {last}")
